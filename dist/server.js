@@ -37029,6 +37029,8 @@ var jevResponseSchema = external_exports.object({
 // src/jev/client.ts
 var JEV_API_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 var JEV_MODEL = "jev-latest";
+var GATEWAY_API_ENDPOINT = "https://ai-gateway.vercel.sh/v4/ai/evaluation-model";
+var GATEWAY_MODEL = "typesafe-ai/jev";
 var JevApiError = class extends Error {
   status;
   constructor(message, status) {
@@ -37039,6 +37041,7 @@ var JevApiError = class extends Error {
 };
 var JevClient = class {
   #apiKey;
+  #transport;
   #fetch;
   #sleep;
   #timeoutMilliseconds;
@@ -37047,6 +37050,7 @@ var JevClient = class {
     const apiKey = options.apiKey.trim();
     if (!apiKey) throw new JevApiError("JEV_API_KEY is not set. Export it before starting your coding agent.");
     this.#apiKey = apiKey;
+    this.#transport = options.transport ?? "typesafe";
     this.#fetch = options.fetchImplementation ?? fetch;
     this.#sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
     this.#timeoutMilliseconds = options.timeoutMilliseconds ?? 3e4;
@@ -37057,17 +37061,22 @@ var JevClient = class {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.#timeoutMilliseconds);
       try {
-        const response = await this.#fetch(JEV_API_ENDPOINT, {
+        const gateway = this.#transport === "gateway";
+        const response = await this.#fetch(gateway ? GATEWAY_API_ENDPOINT : JEV_API_ENDPOINT, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${this.#apiKey}`,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            ...gateway ? GATEWAY_HEADERS : {}
           },
-          body: JSON.stringify({ state, model: JEV_MODEL, questions }),
+          body: JSON.stringify(
+            gateway ? { state, questions: toGatewayQuestions(questions) } : { state, model: JEV_MODEL, questions }
+          ),
           signal: controller.signal
         });
         if (response.ok) {
-          const rawResponse = await response.json();
+          const body = await response.json();
+          const rawResponse = gateway ? fromGatewayResponse(body, questions) : body;
           const parsed = jevResponseSchema.safeParse(rawResponse);
           if (!parsed.success) {
             throw new JevApiError("Jev returned a response that did not match its documented schema.");
@@ -37092,6 +37101,46 @@ var JevClient = class {
     throw new JevApiError("Jev request failed after retries.");
   }
 };
+var GATEWAY_HEADERS = {
+  "ai-gateway-protocol-version": "0.0.1",
+  "ai-gateway-auth-method": "api-key",
+  "ai-evaluation-model-specification-version": "4",
+  "ai-model-id": GATEWAY_MODEL
+};
+function toGatewayQuestions(questions) {
+  return Object.fromEntries(
+    Object.entries(questions).map(([id, question]) => [
+      id,
+      question.type === "noul" ? { ...question, type: "boolean" } : question
+    ])
+  );
+}
+function fromGatewayResponse(body, questions) {
+  if (!isRecord(body) || !isRecord(body.answers)) return body;
+  const typesafe = isRecord(body.providerMetadata) ? body.providerMetadata.typesafe : void 0;
+  const reportedConfidence = isRecord(typesafe) && isRecord(typesafe.confidence) ? typesafe.confidence : {};
+  const answers = Object.fromEntries(
+    Object.entries(body.answers).map(([id, answer]) => {
+      if (!isRecord(answer)) return [id, answer];
+      if (answer.type === "boolean") return [id, { type: "noul", noul: answer.probability }];
+      const probabilities = isRecord(answer.probabilities) ? answer.probabilities : {};
+      const reported = reportedConfidence[id];
+      const confidence = typeof reported === "number" ? reported : Math.max(0, ...Object.values(probabilities).filter((value) => typeof value === "number"));
+      if (answer.type === "score") {
+        const question = questions[id];
+        const legend = question?.type === "score" ? Object.fromEntries(question.criteria.map((label, index) => [String(index), label])) : {};
+        return [id, { ...answer, legend, probabilities, confidence }];
+      }
+      return [id, { ...answer, probabilities, confidence }];
+    })
+  );
+  const usage = isRecord(body.usage) ? body.usage : {};
+  return {
+    model: GATEWAY_MODEL,
+    answers,
+    usage: { input_tokens: usage.inputTokens ?? 0, output_tokens: usage.outputTokens ?? 0 }
+  };
+}
 function isRetryable(status) {
   return status === 429 || status === 529 || status >= 500;
 }
@@ -37105,7 +37154,13 @@ async function apiStatusError(response) {
     );
   }
   if (status === 401) {
-    return new JevApiError("Jev rejected JEV_API_KEY. Check that the key is current and available to the MCP process.", status);
+    return new JevApiError(
+      "Jev rejected the API key (JEV_API_KEY or AI_GATEWAY_API_KEY). Check that it is current and available to the MCP process.",
+      status
+    );
+  }
+  if (status === 402) {
+    return new JevApiError("Vercel AI Gateway credits or budget are exhausted for this key.", status);
   }
   if (status === 422) {
     return new JevApiError("Jev rejected the supplied evaluation context or questions.", status);
@@ -37144,20 +37199,20 @@ function isAbortError(error62) {
 }
 
 // src/config/environment.ts
-function getJevApiKey(environment = process.env) {
-  const apiKey = environment.JEV_API_KEY?.trim();
-  if (!apiKey) {
-    throw new JevApiError("JEV_API_KEY is not set. Export it before starting your coding agent.");
-  }
-  return apiKey;
+function getJevCredentials(environment = process.env) {
+  const direct = environment.JEV_API_KEY?.trim();
+  if (direct) return { apiKey: direct, transport: "typesafe" };
+  const gateway = environment.AI_GATEWAY_API_KEY?.trim();
+  if (gateway) return { apiKey: gateway, transport: "gateway" };
+  throw new JevApiError(
+    "Set JEV_API_KEY (TypeSafe) or AI_GATEWAY_API_KEY (Vercel AI Gateway) before starting your coding agent."
+  );
 }
 
 // src/evaluation/review.ts
 async function reviewWithJev(rawInput, dependencies = {}) {
   const input2 = reviewInputSchema.parse(rawInput);
-  const client = dependencies.client ?? new JevClient({
-    apiKey: dependencies.apiKey ?? getJevApiKey()
-  });
+  const client = dependencies.client ?? new JevClient(dependencies.apiKey !== void 0 ? { apiKey: dependencies.apiKey } : getJevCredentials());
   const response = await client.evaluate(toJevState(input2), buildJevQuestions());
   return toEvaluation(response, input2.previousEvaluation);
 }

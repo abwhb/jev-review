@@ -54,6 +54,12 @@ Set your API key before starting the coding agent:
 export JEV_API_KEY="your-key"
 ```
 
+Or, if you already use [Vercel AI Gateway](https://vercel.com/docs/ai-gateway), skip the TypeSafe key and set your gateway key instead; Jev Review then calls `typesafe-ai/jev` through the gateway (same questions, same scores, billed to your gateway credits):
+
+```bash
+export AI_GATEWAY_API_KEY="your-gateway-key"
+```
+
 Install Jev Review directly from GitHub—no npm publication is required:
 
 ```bash
@@ -319,7 +325,7 @@ claude plugin validate . --strict
 
 ## Security and privacy
 
-The local MCP process reads `JEV_API_KEY` and uses it only in the TLS Authorization header sent directly to `https://api.typesafe.ai/v1/systemone`. Jev Review never stores or logs the key.
+The local MCP process reads `JEV_API_KEY` (or, when that is unset, `AI_GATEWAY_API_KEY`) and uses it only in the TLS Authorization header sent directly to `https://api.typesafe.ai/v1/systemone` (or `https://ai-gateway.vercel.sh/v4/ai/evaluation-model`). Jev Review never stores or logs the key.
 
 Only the `task`, `diff`, `files`, and `repositoryContext` explicitly supplied to `jev_review` are sent to Jev. `previousEvaluation` is compared locally and is not included in the current code context. No repository files are discovered or uploaded automatically.
 
